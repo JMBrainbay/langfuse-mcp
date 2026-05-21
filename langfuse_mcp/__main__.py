@@ -127,6 +127,9 @@ TOOL_GROUPS = {
         "create_dataset",
         "create_dataset_item",
         "delete_dataset_item",
+        "list_dataset_runs",
+        "get_dataset_run",
+        "list_dataset_run_items",
     ],
     "annotation_queues": [
         "list_annotation_queues",
@@ -3386,6 +3389,224 @@ async def delete_dataset_item(
 
     except Exception as e:
         logger.error(f"Error deleting dataset item '{item_id}': {e}")
+        raise
+
+
+async def list_dataset_runs(
+    ctx: Context,
+    dataset_name: str = Field(..., description="The name of the dataset to list runs for"),
+    page: int = Field(1, ge=1, description="Page number for pagination (starts at 1)"),
+    limit: int = Field(50, ge=1, le=100, description="Items per page (max 100)"),
+) -> ResponseDict:
+    """List all runs for a dataset with pagination.
+
+    Dataset runs represent evaluation experiment runs against a dataset. Each run
+    links traces/observations back to dataset items for comparison and scoring.
+
+    Args:
+        ctx: Context object containing lifespan context with Langfuse client
+        dataset_name: The name of the dataset to list runs for
+        page: Page number for pagination (starts at 1)
+        limit: Maximum items per page (max 100)
+
+    Returns:
+        A dictionary containing:
+        - data: List of run metadata objects (id, name, description, metadata, datasetId, datasetName, createdAt, updatedAt)
+        - metadata: Pagination info (page, limit, total, dataset_name)
+    """
+    state = cast(MCPState, ctx.request_context.lifespan_context)
+
+    try:
+        page = _normalize_field_default(page) or 1
+        limit = _normalize_field_default(limit) or 50
+
+        response = state.langfuse_client.api.datasets.get_runs(dataset_name=dataset_name, page=page, limit=limit)
+
+        items, pagination = _extract_items_from_response(response)
+        raw_runs = [_sdk_object_to_python(r) for r in items]
+
+        run_list = []
+        for r in raw_runs:
+            run_list.append(
+                {
+                    "id": r.get("id"),
+                    "name": r.get("name"),
+                    "description": r.get("description"),
+                    "metadata": r.get("metadata"),
+                    "datasetId": r.get("datasetId") or r.get("dataset_id"),
+                    "datasetName": r.get("datasetName") or r.get("dataset_name"),
+                    "createdAt": r.get("createdAt") or r.get("created_at"),
+                    "updatedAt": r.get("updatedAt") or r.get("updated_at"),
+                }
+            )
+
+        logger.info(f"Listed {len(run_list)} runs for dataset '{dataset_name}' (page={page}, limit={limit})")
+
+        return {
+            "data": run_list,
+            "metadata": {
+                "dataset_name": dataset_name,
+                "page": page,
+                "limit": limit,
+                "item_count": len(run_list),
+                "total": pagination.get("total"),
+            },
+        }
+
+    except Exception as e:
+        logger.error(f"Error listing runs for dataset '{dataset_name}': {e}")
+        raise
+
+
+async def get_dataset_run(
+    ctx: Context,
+    dataset_name: str = Field(..., description="The name of the dataset"),
+    run_name: str = Field(..., description="The name of the run to fetch"),
+    output_mode: OUTPUT_MODE_LITERAL = Field(
+        "compact",
+        description="Output format: 'compact' truncates, 'full_json_string' returns full data, 'full_json_file' writes to file",
+    ),
+) -> ResponseDict | str:
+    """Get a specific dataset run including all its run items.
+
+    Returns the run metadata together with all associated run items. Each run item
+    links a dataset item to a trace (and optionally an observation) so you can
+    inspect the model output and any scores for that evaluation.
+
+    Args:
+        ctx: Context object containing lifespan context with Langfuse client
+        dataset_name: The name of the dataset
+        run_name: The name of the run to fetch
+        output_mode: How to format the response data
+
+    Returns:
+        A dictionary containing:
+        - data: Run object with id, name, description, metadata, datasetId, datasetName,
+                createdAt, updatedAt, and datasetRunItems (list of run items with traceId, observationId, etc.)
+        - metadata: dataset_name, run_name, item_count
+    """
+    state = cast(MCPState, ctx.request_context.lifespan_context)
+
+    try:
+        run = state.langfuse_client.api.datasets.get_run(dataset_name=dataset_name, run_name=run_name)
+
+        if run is None:
+            raise LookupError(f"Dataset run '{run_name}' not found in dataset '{dataset_name}'")
+
+        result = _sdk_object_to_python(run)
+
+        mode = _ensure_output_mode(output_mode)
+        processed_result, file_meta = process_data_with_mode(result, mode, f"dataset_run_{dataset_name}_{run_name}", state)
+
+        run_items = result.get("datasetRunItems") or result.get("dataset_run_items") or []
+        item_count = len(run_items) if isinstance(run_items, list) else 0
+
+        logger.info(f"Fetched run '{run_name}' for dataset '{dataset_name}' ({item_count} items)")
+
+        if mode == OutputMode.FULL_JSON_STRING:
+            return processed_result
+
+        metadata_block = {
+            "dataset_name": dataset_name,
+            "run_name": run_name,
+            "item_count": item_count,
+            "output_mode": mode.value,
+        }
+        if file_meta:
+            metadata_block.update(file_meta)
+
+        return {
+            "data": processed_result,
+            "metadata": metadata_block,
+        }
+
+    except Exception as e:
+        logger.error(f"Error fetching run '{run_name}' for dataset '{dataset_name}': {e}")
+        raise
+
+
+async def list_dataset_run_items(
+    ctx: Context,
+    dataset_name: str = Field(..., description="The name of the dataset"),
+    run_name: str = Field(..., description="The name of the run to list items for"),
+    page: int = Field(1, ge=1, description="Page number for pagination (starts at 1)"),
+    limit: int = Field(50, ge=1, le=100, description="Items per page (max 100)"),
+    output_mode: OUTPUT_MODE_LITERAL = Field(
+        "compact",
+        description="Output format: 'compact' truncates, 'full_json_string' returns full data, 'full_json_file' writes to file",
+    ),
+) -> ResponseDict | str:
+    """List run items for a dataset run with pagination.
+
+    Each run item links a dataset item to a trace (and optionally an observation).
+    Use this for large runs where get_dataset_run would return too many items at once.
+
+    Args:
+        ctx: Context object containing lifespan context with Langfuse client
+        dataset_name: The name of the dataset
+        run_name: The name of the run
+        page: Page number for pagination (starts at 1)
+        limit: Maximum items per page (max 100)
+        output_mode: How to format the response data
+
+    Returns:
+        A dictionary containing:
+        - data: List of run item objects (id, datasetRunId, datasetRunName, datasetItemId, traceId, observationId)
+        - metadata: Pagination info (page, limit, total, dataset_name, run_name)
+    """
+    state = cast(MCPState, ctx.request_context.lifespan_context)
+
+    try:
+        page = _normalize_field_default(page) or 1
+        limit = _normalize_field_default(limit) or 50
+
+        # dataset_run_items.list requires dataset_id; fetch it from the dataset
+        dataset = state.langfuse_client.api.datasets.get(dataset_name=dataset_name)
+        if dataset is None:
+            raise LookupError(f"Dataset '{dataset_name}' not found")
+
+        dataset_dict = _sdk_object_to_python(dataset)
+        dataset_id = dataset_dict.get("id") or dataset_dict.get("dataset_id")
+
+        response = state.langfuse_client.api.dataset_run_items.list(
+            dataset_id=dataset_id,
+            run_name=run_name,
+            page=page,
+            limit=limit,
+        )
+
+        items, pagination = _extract_items_from_response(response)
+        raw_items = [_sdk_object_to_python(item) for item in items]
+
+        mode = _ensure_output_mode(output_mode)
+        processed_items, file_meta = process_data_with_mode(
+            raw_items, mode, f"dataset_run_items_{dataset_name}_{run_name}", state
+        )
+
+        logger.info(f"Listed {len(raw_items)} run items for '{dataset_name}/{run_name}' (page={page}, limit={limit})")
+
+        if mode == OutputMode.FULL_JSON_STRING:
+            return processed_items
+
+        metadata_block = {
+            "dataset_name": dataset_name,
+            "run_name": run_name,
+            "page": page,
+            "limit": limit,
+            "item_count": len(raw_items),
+            "total": pagination.get("total"),
+            "output_mode": mode.value,
+        }
+        if file_meta:
+            metadata_block.update(file_meta)
+
+        return {
+            "data": processed_items,
+            "metadata": metadata_block,
+        }
+
+    except Exception as e:
+        logger.error(f"Error listing run items for '{dataset_name}/{run_name}': {e}")
         raise
 
 

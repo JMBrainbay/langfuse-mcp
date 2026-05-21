@@ -27,6 +27,9 @@ def test_dataset_tools_in_tool_groups():
         "create_dataset",
         "create_dataset_item",
         "delete_dataset_item",
+        "list_dataset_runs",
+        "get_dataset_run",
+        "list_dataset_run_items",
     ]
     for tool in expected_tools:
         assert tool in dataset_tools, f"Tool {tool} missing from TOOL_GROUPS['datasets']"
@@ -262,6 +265,140 @@ def test_delete_dataset_item(state):
     # Verify it's gone
     with pytest.raises(LookupError):
         asyncio.run(get_dataset_item(ctx, item_id=item_id))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Output Mode Tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dataset Run Tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_list_dataset_runs(state):
+    """list_dataset_runs should return all runs for a dataset with pagination."""
+    from langfuse_mcp.__main__ import list_dataset_runs
+
+    ctx = FakeContext(state)
+
+    # Seed datasets and runs directly via the fake client
+    state.langfuse_client.create_dataset(name="eval-set")
+    state.langfuse_client.create_dataset_run(dataset_name="eval-set", run_name="run-v1", description="First run")
+    state.langfuse_client.create_dataset_run(dataset_name="eval-set", run_name="run-v2", description="Second run")
+
+    result = asyncio.run(list_dataset_runs(ctx, dataset_name="eval-set", page=1, limit=10))
+    assert len(result["data"]) == 2
+    assert result["metadata"]["dataset_name"] == "eval-set"
+    assert result["metadata"]["total"] == 2
+
+    names = [r["name"] for r in result["data"]]
+    assert "run-v1" in names
+    assert "run-v2" in names
+
+
+def test_list_dataset_runs_empty(state):
+    """list_dataset_runs should return empty list when no runs exist."""
+    from langfuse_mcp.__main__ import list_dataset_runs
+
+    ctx = FakeContext(state)
+    state.langfuse_client.create_dataset(name="empty-set")
+
+    result = asyncio.run(list_dataset_runs(ctx, dataset_name="empty-set"))
+    assert result["data"] == []
+    assert result["metadata"]["total"] == 0
+
+
+def test_get_dataset_run(state):
+    """get_dataset_run should return a run with its items."""
+    from langfuse_mcp.__main__ import get_dataset_run
+
+    ctx = FakeContext(state)
+
+    state.langfuse_client.create_dataset(name="eval-set")
+    create_result = asyncio.run(
+        __import__("langfuse_mcp.__main__", fromlist=["create_dataset_item"]).create_dataset_item(
+            ctx, dataset_name="eval-set", input="q1", expected_output="a1"
+        )
+    )
+    item_id = create_result["data"]["id"]
+
+    state.langfuse_client.create_dataset_run(dataset_name="eval-set", run_name="run-v1", description="Test run")
+    state.langfuse_client.create_dataset_run_item(
+        dataset_name="eval-set", run_name="run-v1", dataset_item_id=item_id, trace_id="trace-abc"
+    )
+
+    result = asyncio.run(get_dataset_run(ctx, dataset_name="eval-set", run_name="run-v1"))
+    data = result["data"]
+    assert data["name"] == "run-v1"
+    assert result["metadata"]["dataset_name"] == "eval-set"
+    assert result["metadata"]["run_name"] == "run-v1"
+    assert result["metadata"]["item_count"] == 1
+
+
+def test_get_dataset_run_not_found(state):
+    """get_dataset_run should raise LookupError for a non-existent run."""
+    from langfuse_mcp.__main__ import get_dataset_run
+
+    ctx = FakeContext(state)
+    state.langfuse_client.create_dataset(name="eval-set")
+
+    with pytest.raises(LookupError, match="not found"):
+        asyncio.run(get_dataset_run(ctx, dataset_name="eval-set", run_name="nonexistent"))
+
+
+def test_list_dataset_run_items(state):
+    """list_dataset_run_items should return paginated run items."""
+    from langfuse_mcp.__main__ import list_dataset_run_items
+
+    ctx = FakeContext(state)
+
+    state.langfuse_client.create_dataset(name="eval-set")
+    state.langfuse_client.create_dataset_run(dataset_name="eval-set", run_name="run-v1")
+    state.langfuse_client.create_dataset_run_item(
+        dataset_name="eval-set", run_name="run-v1", dataset_item_id="item-1", trace_id="trace-1"
+    )
+    state.langfuse_client.create_dataset_run_item(
+        dataset_name="eval-set", run_name="run-v1", dataset_item_id="item-2", trace_id="trace-2"
+    )
+
+    result = asyncio.run(list_dataset_run_items(ctx, dataset_name="eval-set", run_name="run-v1", page=1, limit=10))
+    assert len(result["data"]) == 2
+    assert result["metadata"]["dataset_name"] == "eval-set"
+    assert result["metadata"]["run_name"] == "run-v1"
+    assert result["metadata"]["total"] == 2
+
+    trace_ids = [item.get("trace_id") for item in result["data"]]
+    assert "trace-1" in trace_ids
+    assert "trace-2" in trace_ids
+
+
+def test_list_dataset_run_items_dataset_not_found(state):
+    """list_dataset_run_items should raise LookupError for a non-existent dataset."""
+    from langfuse_mcp.__main__ import list_dataset_run_items
+
+    ctx = FakeContext(state)
+
+    with pytest.raises(LookupError, match="not found"):
+        asyncio.run(list_dataset_run_items(ctx, dataset_name="nonexistent", run_name="run-v1"))
+
+
+def test_list_dataset_runs_output_mode(state):
+    """list_dataset_run_items should respect output_mode parameter."""
+    from langfuse_mcp.__main__ import list_dataset_run_items
+
+    ctx = FakeContext(state)
+
+    state.langfuse_client.create_dataset(name="eval-set")
+    state.langfuse_client.create_dataset_run(dataset_name="eval-set", run_name="run-v1")
+    state.langfuse_client.create_dataset_run_item(
+        dataset_name="eval-set", run_name="run-v1", dataset_item_id="item-1", trace_id="trace-xyz"
+    )
+
+    result = asyncio.run(list_dataset_run_items(ctx, dataset_name="eval-set", run_name="run-v1", output_mode="full_json_string"))
+    assert isinstance(result, str)
+    assert "trace-xyz" in result
 
 
 # ─────────────────────────────────────────────────────────────────────────────

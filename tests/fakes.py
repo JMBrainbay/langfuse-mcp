@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 
 
@@ -70,6 +71,34 @@ class FakeDatasetItem:
     source_trace_id: str | None = None
     source_observation_id: str | None = None
     status: str = "ACTIVE"
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+@dataclass
+class FakeDatasetRun:
+    """Dataset run record returned by the fake SDK."""
+
+    id: str
+    name: str
+    dataset_id: str
+    dataset_name: str
+    description: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+@dataclass
+class FakeDatasetRunItem:
+    """Dataset run item record returned by the fake SDK."""
+
+    id: str
+    dataset_run_id: str
+    dataset_run_name: str
+    dataset_item_id: str
+    trace_id: str | None = None
+    observation_id: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -348,6 +377,28 @@ class _DatasetsAPI:
         self._store.datasets[name] = dataset
         return dataset
 
+    def get_runs(self, dataset_name: str, **kwargs: Any) -> FakePaginatedResponse:
+        page = kwargs.get("page", 1)
+        limit = kwargs.get("limit", 50)
+        runs = [r for r in self._store.dataset_runs.values() if r.dataset_name == dataset_name]
+        total = len(runs)
+        start = (page - 1) * limit
+        end = start + limit
+        paged = [r.__dict__ for r in runs[start:end]]
+        return FakePaginatedResponse(data=paged, meta={"next_page": None, "total": total})
+
+    def get_run(self, dataset_name: str, run_name: str, **kwargs: Any) -> Any:
+        run = self._store.dataset_runs.get((dataset_name, run_name))
+        if run is None:
+            return None
+        run_items = [
+            item.__dict__
+            for item in self._store.dataset_run_items.values()
+            if item.dataset_run_name == run_name and item.dataset_run_id == run.id
+        ]
+        ns = SimpleNamespace(**run.__dict__, dataset_run_items=run_items)
+        return ns
+
 
 class _DatasetItemsAPI:
     """Fake implementation of dataset_items resource client."""
@@ -435,6 +486,33 @@ class _DatasetItemsAPI:
         if id in self._store.dataset_items:
             del self._store.dataset_items[id]
         return {"success": True}
+
+
+class _DatasetRunItemsAPI:
+    """Fake implementation of dataset_run_items resource client."""
+
+    def __init__(self, store: FakeDataStore) -> None:
+        self._store = store
+
+    def list(self, *, dataset_id: str, run_name: str, page: int = 1, limit: int = 50, **kwargs: Any) -> FakePaginatedResponse:
+        items = [
+            item.__dict__
+            for item in self._store.dataset_run_items.values()
+            if item.dataset_run_name == run_name
+        ]
+        # filter by dataset_id via run lookup
+        run = next(
+            (r for r in self._store.dataset_runs.values() if r.name == run_name and r.dataset_id == dataset_id),
+            None,
+        )
+        if run is not None:
+            items = [item for item in items if item.get("dataset_run_id") == run.id]
+
+        total = len(items)
+        start = (page - 1) * limit
+        end = start + limit
+        paged = items[start:end]
+        return FakePaginatedResponse(data=paged, meta={"next_page": None, "total": total})
 
 
 class _AnnotationQueuesAPI:
@@ -735,6 +813,7 @@ class FakeAPI:
         self.prompts = _PromptsAPI(store)
         self.datasets = _DatasetsAPI(store)
         self.dataset_items = _DatasetItemsAPI(store)
+        self.dataset_run_items = _DatasetRunItemsAPI(store)
         self.annotation_queues = _AnnotationQueuesAPI(store)
         self.score_v_2 = _ScoreV2API(store)
 
@@ -866,6 +945,8 @@ class FakeDataStore:
         self.prompts: dict[str, list[FakePromptBase]] = {}
         self.datasets: dict[str, FakeDataset] = {}
         self.dataset_items: dict[str, FakeDatasetItem] = {}
+        self.dataset_runs: dict[tuple[str, str], FakeDatasetRun] = {}  # keyed by (dataset_name, run_name)
+        self.dataset_run_items: dict[str, FakeDatasetRunItem] = {}
         self.annotation_queues: dict[str, FakeAnnotationQueue] = {
             "queue_1": FakeAnnotationQueue(
                 id="queue_1",
@@ -1060,6 +1141,58 @@ class FakeLangfuse:
     def get_dataset(self, name: str, **kwargs: Any) -> FakeDataset | None:
         """Fetch a dataset by name."""
         return self._store.datasets.get(name)
+
+    def create_dataset_run(
+        self,
+        *,
+        dataset_name: str,
+        run_name: str,
+        description: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> FakeDatasetRun:
+        """Create a fake dataset run and return it."""
+        dataset = self._store.datasets.get(dataset_name)
+        dataset_id = dataset.id if dataset else f"dataset_{dataset_name}"
+        now = datetime.now(timezone.utc)
+        run = FakeDatasetRun(
+            id=f"run_{dataset_name}_{run_name}",
+            name=run_name,
+            dataset_id=dataset_id,
+            dataset_name=dataset_name,
+            description=description,
+            metadata=metadata or {},
+            created_at=now,
+            updated_at=now,
+        )
+        self._store.dataset_runs[(dataset_name, run_name)] = run
+        return run
+
+    def create_dataset_run_item(
+        self,
+        *,
+        dataset_name: str,
+        run_name: str,
+        dataset_item_id: str,
+        trace_id: str | None = None,
+        observation_id: str | None = None,
+    ) -> FakeDatasetRunItem:
+        """Create a fake dataset run item and return it."""
+        run = self._store.dataset_runs.get((dataset_name, run_name))
+        run_id = run.id if run else f"run_{dataset_name}_{run_name}"
+        now = datetime.now(timezone.utc)
+        item_id = f"run_item_{len(self._store.dataset_run_items) + 1}"
+        item = FakeDatasetRunItem(
+            id=item_id,
+            dataset_run_id=run_id,
+            dataset_run_name=run_name,
+            dataset_item_id=dataset_item_id,
+            trace_id=trace_id,
+            observation_id=observation_id,
+            created_at=now,
+            updated_at=now,
+        )
+        self._store.dataset_run_items[item_id] = item
+        return item
 
     def close(self) -> None:
         """Mark the fake client as closed to mirror the real SDK."""
